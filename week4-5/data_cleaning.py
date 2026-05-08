@@ -19,8 +19,8 @@ import json
 import pandas as pd
 import numpy as np
 
-WEEK2_DIR = r"D:\IDXexchange\week2\data"
-WEEK3_DIR = r"D:\IDXexchange\week3"
+WEEK2_DIR = r"D:\IDXexchange\week2-3\data"
+WEEK3_DIR = r"D:\IDXexchange\week4"
 DATA_DIR  = os.path.join(WEEK3_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -95,7 +95,7 @@ def parse_dates(df, fields, label):
 sold,   sold_date_results   = parse_dates(sold,   DATE_FIELDS_SOLD,   "SOLD")
 listed, listed_date_results = parse_dates(listed, DATE_FIELDS_LISTED, "LISTED")
 
-# Flag ListingContractDate > CloseDate (sold only)
+# Flag 1: ListingContractDate > CloseDate
 flag_col = 'listing_after_close_flag'
 if 'ListingContractDate' in sold.columns and 'CloseDate' in sold.columns:
     sold[flag_col] = (
@@ -103,11 +103,39 @@ if 'ListingContractDate' in sold.columns and 'CloseDate' in sold.columns:
         sold['CloseDate'].notna() &
         (sold['ListingContractDate'] > sold['CloseDate'])
     ).astype(int)
-    n_flagged = sold[flag_col].sum()
+    n_flagged = int(sold[flag_col].sum())
     print(f"\n  Flagged {n_flagged:,} sold records where ListingContractDate > CloseDate")
 else:
     n_flagged = 0
     sold[flag_col] = 0
+
+# Flag 2: PurchaseContractDate > CloseDate
+flag_purchase = 'purchase_after_close_flag'
+if 'PurchaseContractDate' in sold.columns and 'CloseDate' in sold.columns:
+    sold[flag_purchase] = (
+        sold['PurchaseContractDate'].notna() &
+        sold['CloseDate'].notna() &
+        (sold['PurchaseContractDate'] > sold['CloseDate'])
+    ).astype(int)
+    n_purchase_flag = int(sold[flag_purchase].sum())
+    print(f"  Flagged {n_purchase_flag:,} sold records where PurchaseContractDate > CloseDate")
+else:
+    n_purchase_flag = 0
+    sold[flag_purchase] = 0
+
+# Flag 3: ListingContractDate > PurchaseContractDate (negative timeline)
+flag_neg = 'negative_timeline_flag'
+if all(c in sold.columns for c in ['ListingContractDate', 'PurchaseContractDate']):
+    sold[flag_neg] = (
+        sold['ListingContractDate'].notna() &
+        sold['PurchaseContractDate'].notna() &
+        (sold['ListingContractDate'] > sold['PurchaseContractDate'])
+    ).astype(int)
+    n_neg_flag = int(sold[flag_neg].sum())
+    print(f"  Flagged {n_neg_flag:,} sold records where ListingContractDate > PurchaseContractDate")
+else:
+    n_neg_flag = 0
+    sold[flag_neg] = 0
 
 # ============================================================
 # 4. NUMERIC CLEANING
@@ -157,9 +185,11 @@ listed, _ = flag_invalid(listed, 'ListPrice', 'LISTED',
 listed, _ = flag_invalid(listed, 'LivingArea', 'LISTED',
                           'LivingArea <= 0',  lambda s: s <= 0)
 
-# Composite any-flag column
+# Composite any-flag column (numeric + all date flags)
 price_flags  = [c for c in sold.columns if c.endswith('_invalid_flag')]
-sold['any_invalid_flag'] = (sold[price_flags].max(axis=1) | sold[flag_col]).astype(int)
+date_flag_cols = [flag_col, flag_purchase, flag_neg]
+all_sold_flags = price_flags + [c for c in date_flag_cols if c in sold.columns]
+sold['any_invalid_flag'] = sold[all_sold_flags].max(axis=1).astype(int)
 n_any = int(sold['any_invalid_flag'].sum())
 print(f"\n  SOLD — total records with at least one quality flag: {n_any:,}")
 
@@ -185,6 +215,28 @@ for label, df in [("sold", sold), ("listed", listed)]:
             print(f"  [{label.upper()}] {col:25s}  {null_pct:5.1f}% null")
             geo_stats[f"{label}_{col}"] = round(null_pct, 2)
 
+# Geographic quality flags
+print("\n  --- Geographic quality flags ---")
+for label, df in [("sold", sold), ("listed", listed)]:
+    lat = pd.to_numeric(df.get('Latitude', pd.Series(dtype=float)), errors='coerce')
+    lon = pd.to_numeric(df.get('Longitude', pd.Series(dtype=float)), errors='coerce')
+    n_null_geo  = int((lat.isna() | lon.isna()).sum())
+    n_zero_lat  = int((lat == 0).sum())
+    n_zero_lon  = int((lon == 0).sum())
+    n_pos_lon   = int((lon > 0).sum())    # CA should be negative longitude
+    print(f"  [{label.upper()}] null lat or lon          : {n_null_geo:,}")
+    print(f"  [{label.upper()}] lat == 0 (sentinel)      : {n_zero_lat:,}")
+    print(f"  [{label.upper()}] lon == 0 (sentinel)      : {n_zero_lon:,}")
+    print(f"  [{label.upper()}] lon > 0  (wrong side CA) : {n_pos_lon:,}")
+    geo_stats[f"{label}_null_geo"]  = n_null_geo
+    geo_stats[f"{label}_zero_lat"]  = n_zero_lat
+    geo_stats[f"{label}_zero_lon"]  = n_zero_lon
+    geo_stats[f"{label}_pos_lon"]   = n_pos_lon
+
+    df['geo_null_flag']     = (lat.isna() | lon.isna()).astype(int)
+    df['geo_sentinel_flag'] = ((lat == 0) | (lon == 0)).astype(int)
+    df['geo_invalid_flag']  = (lon > 0).astype(int)
+
 # ============================================================
 # 6. CLEANING SUMMARY STATS
 # ============================================================
@@ -202,6 +254,8 @@ summary = {
         "cols_dropped": len(sold_dropped_cols),
         "dropped_col_names": sold_dropped_cols,
         "date_flags": int(n_flagged),
+        "purchase_after_close_flags": n_purchase_flag,
+        "negative_timeline_flags": n_neg_flag,
         "any_invalid_flag": n_any,
         "date_parse_results": sold_date_results,
     },
